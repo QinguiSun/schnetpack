@@ -10,6 +10,66 @@ import schnetpack.nn as snn
 
 __all__ = ["PaiNN", "PaiNNInteraction", "PaiNNMixing"]
 
+class EquivariantCompressionLayer(nn.Module):
+    def __init__(self, num_vector_channels, compressed_channels):
+        super().__init__()
+        self.fc_scalar_weights = nn.Sequential(
+            nn.Linear(num_vector_channels, 32),
+            nn.ReLU(),
+            nn.Linear(32, compressed_channels),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, vectors):
+        # vectors: [batch, num_vector_channels, 3]
+
+        # Compute invariants (e.g., vector norms)
+        scalar_invariants = torch.norm(vectors, dim=-1)  # shape: [batch, num_vector_channels]
+
+        # Generate scalar weights equivariantly
+        weights = self.fc_scalar_weights(scalar_invariants)  # [batch, compressed_channels]
+
+        # Perform weighted pooling
+        print()
+        compressed_vectors = torch.einsum('bvc,bl->blc', vectors, weights)
+        #torch.einsum('mij,ml->mlj', vectors, weights)  # (batch, compressed_channels, 3) <- (batch, num_vector_channels, 3) (batch, compressed_channels)
+        # resulting shape: [batch, compressed_channels, 3]
+
+        return compressed_vectors
+    
+class EquivariantReconstructionLayer(nn.Module):
+    def __init__(self, compressed_channels, reconstructed_channels):
+        super().__init__()
+        self.compressed_channels = compressed_channels
+        self.reconstructed_channels = reconstructed_channels
+        self.fc_scalars = nn.Sequential(
+            nn.Linear(compressed_channels, 32),
+            nn.ReLU(),
+            nn.Linear(32, reconstructed_channels * compressed_channels)
+        )
+
+    def forward(self, compressed_vectors):
+        # compressed_vectors: [batch, compressed_channels, 3]
+
+        # Compute invariants
+        scalar_invariants = torch.norm(compressed_vectors, dim=-1)  # [batch, compressed_channels]
+        
+        # Generate scalar weights explicitly mapping between channels
+        scalar_weights = self.fc_scalars(scalar_invariants).view(
+            -1, self.reconstructed_channels, self.compressed_channels
+        )  # [batch, reconstructed_channels, compressed_channels]
+        
+        # Reconstruct rank-2 tensors by tensor products
+        # For simplicity, self tensor product: v ⊗ v
+        rank2_tensors = torch.einsum('bci,bcj->bcij', compressed_vectors, compressed_vectors)
+        # shape: [batch, compressed_channels, 3, 3]
+
+        # Weighted sum to combine tensors
+        # Explicit contraction over compressed_channels
+        reconstructed_tensors = torch.einsum('brc, bcij -> brij', scalar_weights, rank2_tensors)
+        # [batch, reconstructed_channels, 3, 3]
+
+        return reconstructed_tensors
 
 class PaiNNInteraction(nn.Module):
     r"""PaiNN interaction block for modeling equivariant interactions of atomistic systems."""
@@ -26,6 +86,14 @@ class PaiNNInteraction(nn.Module):
         self.interatomic_context_net = nn.Sequential(
             snn.Dense(n_atom_basis, n_atom_basis, activation=activation),
             snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
+        )
+                
+        self.compression_layer = EquivariantCompressionLayer(
+            num_vector_channels=n_atom_basis*2, compressed_channels=n_atom_basis
+        )
+        
+        self.reconstruction_layer = EquivariantReconstructionLayer(
+            compressed_channels=n_atom_basis, reconstructed_channels=n_atom_basis
         )
 
     def forward(
@@ -54,17 +122,23 @@ class PaiNNInteraction(nn.Module):
         x = self.interatomic_context_net(q)
         xj = x[idx_j]
         muj = mu[idx_j]
+        mui = mu[idx_i]
         x = Wij * xj
 
         dq, dmuR, dmumu = torch.split(x, self.n_atom_basis, dim=-1)
         dq = snn.scatter_add(dq, idx_i, dim_size=n_atoms)
-        dmu = dmuR * dir_ij[..., None] + dmumu * muj
+        compressed_vector_vj = self.compression_layer(muj)
+        dmu = dmuR * dir_ij[..., None] + dmumu * compressed_vector_vj 
         dmu = snn.scatter_add(dmu, idx_i, dim_size=n_atoms)
 
+        #q = q + dq
+        #mu = mu + dmu
+        compressed_vector_vi = self.compression_layer(torch.transpose(mui), 1, 2)
         q = q + dq
-        mu = mu + dmu
-
-        return q, mu
+        mu = dmu + torch.transpose(compressed_vector_vi, 1, 2)
+        dtm = self.reconstruction_layer(torch.transpose(mu, 1, 2))
+        
+        return q, mu, dtm
 
 
 class PaiNNMixing(nn.Module):
@@ -89,7 +163,7 @@ class PaiNNMixing(nn.Module):
         )
         self.epsilon = epsilon
 
-    def forward(self, q: torch.Tensor, mu: torch.Tensor):
+    def forward(self, q: torch.Tensor, mu: torch.Tensor, dtm: torch.Tensor):
         """Compute intraatomic mixing.
 
         Args:
@@ -112,8 +186,12 @@ class PaiNNMixing(nn.Module):
 
         dqmu_intra = dqmu_intra * torch.sum(mu_V * mu_W, dim=1, keepdim=True)
 
-        q = q + dq_intra + dqmu_intra
-        mu = mu + dmu_intra
+        #q = q + dq_intra + dqmu_intra
+        #mu = mu + dmu_intra
+        q = q + torch.cat([dq_intra, dqmu_intra], dim=-1)
+        tensor_vector = torch.einsum('bfij,bfj->bfi', dtm, torch.transpose(q, 1, 2))  # (b, F, 3) <- (b, F, 3, 3) (b, F, 3)
+        mu = mu + torch.cat([dmu_intra, torch.transpose(tensor_vector, 1, 2)], dim=-1)
+        
         return q, mu
 
 
@@ -160,7 +238,7 @@ class PaiNN(nn.Module):
         """
         super(PaiNN, self).__init__()
 
-        self.n_atom_basis = n_atom_basis
+        self.n_atom_basis = n_atom_basis//2
         self.n_interactions = n_interactions
         self.cutoff_fn = cutoff_fn
         self.cutoff = cutoff_fn.cutoff
@@ -243,10 +321,10 @@ class PaiNN(nn.Module):
 
         # compute interaction blocks and update atomic embeddings
         qs = q.shape
-        mu = torch.zeros((qs[0], 3, qs[2]), device=q.device)
+        mu = torch.zeros((qs[0], 3, qs[2]*2), device=q.device)
         for i, (interaction, mixing) in enumerate(zip(self.interactions, self.mixing)):
-            q, mu = interaction(q, mu, filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
-            q, mu = mixing(q, mu)
+            q, mu, t = interaction(q, mu, filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
+            q, mu = mixing(q, mu, t)
         q = q.squeeze(1)
 
         # collect results
